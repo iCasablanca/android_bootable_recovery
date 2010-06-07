@@ -32,6 +32,7 @@ struct MtdPartition {
     int device_index;
     unsigned int size;
     unsigned int erase_size;
+    unsigned int write_size;
     char *name;
 };
 
@@ -147,6 +148,9 @@ mtd_scan_partitions()
             p->name = strdup(mtdname);
             if (p->name == NULL) {
                 errno = ENOMEM;
+                goto bail;
+            }
+            if (0 != (errno = mtd_partition_info(p, NULL, NULL, &p->write_size))) {
                 goto bail;
             }
             g_mtd_state.partition_count++;
@@ -411,8 +415,9 @@ static int write_block(MtdWriteContext *ctx, const char *data)
     off_t pos = lseek(fd, 0, SEEK_CUR);
     if (pos == (off_t) -1) return 1;
 
-    ssize_t size = partition->erase_size;
-    while (pos + size <= (int) partition->size) {
+    ssize_t erase_size = partition->erase_size;
+    ssize_t write_size = partition->write_size;
+    while (pos + erase_size <= (int) partition->size) {
         loff_t bpos = pos;
         if (ioctl(fd, MEMGETBADBLOCK, &bpos) > 0) {
             add_bad_block_offset(ctx, pos);
@@ -423,7 +428,7 @@ static int write_block(MtdWriteContext *ctx, const char *data)
 
         struct erase_info_user erase_info;
         erase_info.start = pos;
-        erase_info.length = size;
+        erase_info.length = erase_size;
         int retry;
         for (retry = 0; retry < 2; ++retry) {
             if (ioctl(fd, MEMERASE, &erase_info) < 0) {
@@ -431,20 +436,36 @@ static int write_block(MtdWriteContext *ctx, const char *data)
                         pos, strerror(errno));
                 continue;
             }
-            if (lseek(fd, pos, SEEK_SET) != pos ||
-                write(fd, data, size) != size) {
-                fprintf(stderr, "mtd: write error at 0x%08lx (%s)\n",
-                        pos, strerror(errno));
+            
+            // Maintain an old cold path in case for some reason write size
+            // doesn't evenly divide the erase size.
+            if (erase_size % write_size != 0) {
+                if (lseek(fd, pos, SEEK_SET) != pos ||
+                    write(fd, data, erase_size) != erase_size) {
+                    fprintf(stderr, "mtd: write error at 0x%08lx (%s)\n",
+                            pos, strerror(errno));
+                }
+            } else {
+                int writes = erase_size / write_size;
+                int write_count;
+                for (write_count = 0; write_count < writes; write_count++) {
+                    off_t write_pos = pos + (write_count * write_size);
+                    if (lseek(fd, write_pos, SEEK_SET) != pos ||
+                        write(fd, data, write_size) != write_size) {
+                        fprintf(stderr, "mtd: write error at 0x%08lx (%s)\n",
+                                write_pos, strerror(errno));
+                    }
+                }
             }
 
-            char verify[size];
+            char verify[erase_size];
             if (lseek(fd, pos, SEEK_SET) != pos ||
-                read(fd, verify, size) != size) {
+                read(fd, verify, erase_size) != erase_size) {
                 fprintf(stderr, "mtd: re-read error at 0x%08lx (%s)\n",
                         pos, strerror(errno));
                 continue;
             }
-            if (memcmp(data, verify, size) != 0) {
+            if (memcmp(data, verify, erase_size) != 0) {
                 fprintf(stderr, "mtd: verification error at 0x%08lx (%s)\n",
                         pos, strerror(errno));
                 continue;
